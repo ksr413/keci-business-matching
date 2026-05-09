@@ -9,58 +9,73 @@ from collections import defaultdict
 
 # ==================== 데이터 로딩 ====================
 
+# 5/21 상담회 참가 기관 목록
+ORGS_MAY_21 = ['한국환경공단', '한국수자원공사', 'SH엔솔', '한국기술']
+
+def determine_date(org: str) -> str:
+    """소속 기관명으로 참가 날짜 결정"""
+    for org_name in ORGS_MAY_21:
+        if org_name in org:
+            return '2026-05-21'
+    return '2026-05-22'
+
+
 def load_buyers(filepath):
     """
     바이어 리스트 로드 (날짜 정보, 관심 기업 포함)
     Returns: {buyer_id: {id, org, dept, name, interests, interest_tokens, date, interested_companies}}
+
+    2026 컬럼 구조:
+    A: 연번(buyer_id), B: 소속, C: 부서, D: 성명, E: 휴대폰, F: 이메일,
+    G: 분야, H: 세부품목, I: 관심기업(번호), J: 관심기업(기업명)
+    날짜: 소속 기관명으로 판별
+    관심기업: 기업명(J열)으로 매칭
     """
     wb = openpyxl.load_workbook(filepath)
-    ws = wb['구매담당자 명단']
+    ws = wb['Sheet1']
 
     buyers = {}
     warnings = []
 
-    # 데이터 행 읽기
     buyers_without_interested_companies = []
 
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=False), 2):
-        date_cell = row[0].value  # 날짜
-        buyer_id_cell = row[1].value  # 번호
-        org = row[2].value if len(row) > 2 else ""
-        dept = row[3].value if len(row) > 3 else ""
-        name = row[4].value if len(row) > 4 else ""
-        interests_text = row[5].value if len(row) > 5 else ""
-        interested_companies_text = row[6].value if len(row) > 6 else ""
+        buyer_id_cell = row[0].value          # A: 연번
+        org = row[1].value if len(row) > 1 else ""   # B: 소속
+        dept = row[2].value if len(row) > 2 else ""  # C: 부서
+        name = row[3].value if len(row) > 3 else ""  # D: 성명
+        # E: 휴대폰, F: 이메일 (미사용)
+        field = row[6].value if len(row) > 6 else ""       # G: 분야
+        detail = row[7].value if len(row) > 7 else ""      # H: 세부품목
+        # I: 관심기업(번호) (미사용 - 번호 체계가 달라 이름으로 매칭)
+        interested_companies_text = row[9].value if len(row) > 9 else ""  # J: 관심기업(기업명)
 
         if buyer_id_cell is None:
             break
-
-        # 날짜 처리
-        date_str = ""
-        if date_cell:
-            if hasattr(date_cell, 'strftime'):
-                date_str = date_cell.strftime("%Y-%m-%d")
-            else:
-                date_str = str(date_cell)
 
         buyer_id = str(buyer_id_cell).strip()
         org = str(org).strip() if org else ""
         dept = str(dept).strip() if dept else ""
         name = str(name).strip() if name else ""
-        interests_text = str(interests_text).strip() if interests_text else ""
+        field = str(field).strip() if field else ""
+        detail = str(detail).strip() if detail else ""
         interested_companies_text = str(interested_companies_text).strip() if interested_companies_text else ""
 
-        # 관심 기업 번호 추출
+        # 관심품목: 분야 + 세부품목 합산
+        interests_text = ', '.join(filter(None, [field, detail]))
+
+        # 날짜: 소속 기관명으로 결정
+        date_str = determine_date(org)
+
+        # 관심 기업명 추출 (쉼표, 개행으로 분할)
         interested_companies = set()
         if interested_companies_text:
-            # 쉼표, 개행으로 분할
-            company_ids = re.split(r'[,\n]', interested_companies_text)
-            for cid in company_ids:
-                cid = cid.strip()
-                if cid:
-                    interested_companies.add(cid)
+            company_names = re.split(r'[,\n]', interested_companies_text)
+            for cname in company_names:
+                cname = cname.strip()
+                if cname:
+                    interested_companies.add(cname)
         else:
-            # 관심 기업이 없으면 특이사항 기록
             buyers_without_interested_companies.append({
                 'buyer_id': buyer_id,
                 'name': name,
@@ -81,7 +96,6 @@ def load_buyers(filepath):
             'has_interested_companies': len(interested_companies) > 0
         }
 
-    # 관심 기업이 없는 바이어 경고
     if buyers_without_interested_companies:
         for item in buyers_without_interested_companies:
             warnings.append(f"바이어 {item['buyer_id']} ({item['org']} {item['name']}): 관심 기업 없음")
@@ -91,65 +105,58 @@ def load_buyers(filepath):
 
 def load_companies(filepath, buyers):
     """
-    회사 리스트 로드 (구매담당자의 날짜 기반으로 회사의 날짜 결정)
+    회사 리스트 로드
     Returns: {company_name: {seq, name, products, category, wished_buyer_ids, product_tokens, dates}}
+
+    2026 컬럼 구조:
+    A: 연번, B: 회사명, C: 세부품목, D: 대분류,
+    E: 5/21 참가 여부(텍스트), F: 5/22 참가 여부(텍스트),
+    G~M: 기관별 관심 구매담당자 번호, N: 우선 상담 희망 번호
+    날짜: E/F열 유무로 결정
+    관심바이어: G~M열 합산 후 숫자→"A{번호}" 변환
     """
     wb = openpyxl.load_workbook(filepath)
-    ws = wb['Sheet1']
+    ws = wb['설문 답변(1-50)']
 
     companies = {}
     warnings = []
 
-    # 데이터 행 읽기
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=False), 2):
-        seq = row[0].value  # 연번
-        name = row[1].value if len(row) > 1 else ""
-        products = row[2].value if len(row) > 2 else ""
-        category = row[3].value if len(row) > 3 else ""
-        wished_buyers_text = row[4].value if len(row) > 4 else ""
+        seq = row[0].value           # A: 연번
+        name = row[1].value          # B: 회사명
+        products = row[2].value      # C: 세부품목
+        category = row[3].value      # D: 대분류
+        attend_521 = row[4].value    # E: 5/21 참가 여부
+        attend_522 = row[5].value    # F: 5/22 참가 여부
+        # G(6)~M(12): 기관별 관심 구매담당자, N(13): 우선 상담 희망
 
         if seq is None:
             break
 
-        # seq는 string으로 통일 (바이어의 interested_companies와 비교하기 위해)
         seq_str = str(seq).strip()
         name = str(name).strip() if name else ""
         products = str(products).strip() if products else ""
         category = str(category).strip() if category else ""
-        wished_buyers_text = str(wished_buyers_text).strip() if wished_buyers_text else ""
 
-        # 데이터 이상 사항 처리
-        # 1. 회사 71번 (퍼펙트): A6769 → A67, A69
-        if seq == "71" and "A6769" in wished_buyers_text:
-            wished_buyers_text = wished_buyers_text.replace("A6769", "A67, A69")
-            warnings.append(f"회사 {seq} ({name}): A6769를 A67, A69로 보정")
-
-        # 2. 회사 56번 (하이코어): 끝의 단독 A 무시
-        if seq == "56":
-            # 끝에 단독 "A" 제거
-            wished_buyers_text = re.sub(r',\s*A\s*$', '', wished_buyers_text)
-            wished_buyers_text = re.sub(r'^\s*A\s*,', '', wished_buyers_text)
-            if wished_buyers_text.strip() == "A":
-                wished_buyers_text = ""
-            warnings.append(f"회사 {seq} ({name}): 단독 'A' 무시됨")
-
-        # 3. 바이어 ID들 추출 및 공백 처리
-        wished_buyer_ids = set()
-        if wished_buyers_text:
-            # 쉼표, 개행으로 분할
-            buyer_ids = re.split(r'[,\n]', wished_buyers_text)
-            for bid in buyer_ids:
-                bid = bid.strip()
-                if bid and bid != "A":  # 단독 "A" 무시
-                    wished_buyer_ids.add(bid)
-
-        # 4. 회사의 날짜 결정 (선택한 구매담당자들의 날짜)
+        # 날짜 결정: E/F열 텍스트 유무로 판단
         company_dates = set()
-        for buyer_id in wished_buyer_ids:
-            if buyer_id in buyers:
-                buyer_date = buyers[buyer_id].get('date')
-                if buyer_date:
-                    company_dates.add(buyer_date)
+        if attend_521:
+            company_dates.add('2026-05-21')
+        if attend_522:
+            company_dates.add('2026-05-22')
+
+        # 관심 바이어 수집: G~M 7개 컬럼 합산 (숫자 → "A{번호}")
+        wished_buyer_ids = set()
+        for col_idx in range(6, 13):  # G(6)~M(12)
+            if col_idx >= len(row):
+                continue
+            val = row[col_idx].value
+            if val is None:
+                continue
+            for part in re.split(r'[,\n]', str(val)):
+                part = part.strip()
+                if part.isdigit():
+                    wished_buyer_ids.add(f'A{part}')
 
         product_tokens = tokenize(products)
 
@@ -157,11 +164,11 @@ def load_companies(filepath, buyers):
             'seq': seq_str,
             'name': name,
             'products': products,
-            'category': category,  # 대분류(품목분류)
+            'category': category,
             'wished_buyer_ids': wished_buyer_ids,
             'product_tokens': product_tokens,
-            'dates': company_dates,  # 회사가 참가하는 날짜들
-            'category_tokens': {category} if category else set()  # 대분류를 토큰으로
+            'dates': company_dates,
+            'category_tokens': {category} if category else set()
         }
 
     return companies, warnings
@@ -241,8 +248,8 @@ def classify_pairs(buyers: Dict, companies: Dict):
             if buyer_date not in company_dates:
                 continue  # 다른 날짜면 매칭 대상에서 제외
 
-            # Pool 분류 로직
-            buyer_interested_company = company['seq'] in buyer['interested_companies']
+            # Pool 분류 로직 (2026: 기업명으로 매칭)
+            buyer_interested_company = company['name'] in buyer['interested_companies']
             company_interested_buyer = buyer_id in company['wished_buyer_ids']
             buyer_matches_products = buyer_wishes_company(buyer['interest_tokens'], company['product_tokens'])
             buyer_matches_category = buyer_wishes_company(buyer['interest_tokens'], company['category_tokens'])
@@ -601,11 +608,12 @@ def write_results(output_filepath, buyers, companies, matches_by_round, matched,
             ws1.cell(row=row, column=6, value=company['products'])
             ws1.cell(row=row, column=7, value=pool_map[pool])
 
-            # 색상 적용
-            pool_fill = {'pool1': pool1_fill, 'pool2': pool2_fill, 'pool3': pool3_fill}[pool]
+            # 색상 적용 (pool4/5는 색상 없음)
+            pool_fill_map = {'pool1': pool1_fill, 'pool2': pool2_fill, 'pool3': pool3_fill}
             for col in range(1, 8):
                 cell = ws1.cell(row=row, column=col)
-                cell.fill = pool_fill
+                if pool in pool_fill_map:
+                    cell.fill = pool_fill_map[pool]
                 cell.border = border
                 if col == 1 or col == 7:
                     cell.alignment = center_align
@@ -739,12 +747,12 @@ def write_results(output_filepath, buyers, companies, matches_by_round, matched,
 
 def main():
     # 파일 경로
-    buyers_file = "2025 구매담당자 리스트.xlsx"
-    companies_file = "2025 참가기업 리스트_수정.xlsx"
-    output_file = "매칭결과.xlsx"
+    buyers_file = "2026 구매담당자 리스트.xlsx"
+    companies_file = "2026 참가기업 리스트.xlsx"
+    output_file = "매칭결과_2026.xlsx"
 
     print("=" * 60)
-    print("2025 공공기관 내수구매상담회 매칭 시스템")
+    print("2026 공공기관 내수구매상담회 매칭 시스템")
     print("=" * 60)
 
     # 1. 데이터 로드
